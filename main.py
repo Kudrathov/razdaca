@@ -1,6 +1,7 @@
 import re
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -8,29 +9,29 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 
 # === КОНФИГ ===
-BOT_TOKEN = "7595431774:AAGqVaashXulX08PEpgZHsn7LysPrV6rul0"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7595431774:AAGqVaashXulX08PEpgZHsn7LysPrV6rul0")
 SOURCE_CHAT_ID = -1003469691743
 PRED_CHANNEL = -1003755814676
 
-HISTORY_FILE = "simple_history.json"
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# Файлы для модуля "2 карты после 6"
-TWO_CARDS_PRED_FILE = "active_predы_two_cards.json"
-STATS_TWO_CARDS_FILE = "stats_two_cards.json"
-
-# Файлы для модуля "3 карты после 7"
-THREE_CARDS_PRED_FILE = "active_predы_three_cards.json"
-STATS_THREE_CARDS_FILE = "stats_three_cards.json"
+HISTORY_FILE = os.path.join(DATA_DIR, "simple_history.json")
+TWO_CARDS_PRED_FILE = os.path.join(DATA_DIR, "active_predы_two_cards.json")
+STATS_TWO_CARDS_FILE = os.path.join(DATA_DIR, "stats_two_cards.json")
+THREE_CARDS_PRED_FILE = os.path.join(DATA_DIR, "active_predы_three_cards.json")
+STATS_THREE_CARDS_FILE = os.path.join(DATA_DIR, "stats_three_cards.json")
 
 TOTAL_GAMES = 1440
-CHECK_RANGE = 4  # проверка в течение 4 игр: 0,1,2,3
+CHECK_RANGE = 4
 
-# === ЛОГГИРОВАНИЕ ===
+LOG_FILE = os.path.join(DATA_DIR, "simple_predictor.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("simple_predictor.log", encoding="utf-8"),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -53,11 +54,47 @@ def save_json(file: str, data):
 
 def extract_ranks(cards_str: str) -> List[str]:
     """Извлекает только ранги карт (без мастей и эмодзи)"""
-    # Удаляем эмодзи и лишние символы, затем извлекаем ранги
-    cleaned = re.sub(r'[🔰✅]', '', cards_str)  # удаляем эмодзи
-    # Ищем все комбинации числа/буквы + масть
-    ranks = re.findall(r'([A-Z\d]+)\s*[♣♦♥♠]\ufe0f?', cleaned)
+    cleaned = re.sub(r'[🔰✅🟩]', '', cards_str)
+    ranks = re.findall(r'([A-Z\d]+)\s*[♣♦♥♠]', cleaned)
     return ranks
+
+
+def parse_game(text: str) -> Optional[Dict]:
+    # Убираем префикс экспорта Telegram
+    text = re.sub(r'^\[\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}\]\s*[^:]+:\s*', '', text)
+
+    # Обновленный паттерн: галочка может стоять и перед игроком, и перед банкиром
+    pattern = r'#N(\d+)\.\s*(?:✅|🔰)?\s*(\d+)\s*\(([^)]+)\)\s*(?:✅|🔰)?\s*(\d+)\s*\(([^)]+)\)'
+    match = re.search(pattern, text)
+
+    if match:
+        raw_id = int(match.group(1))
+        player_str = match.group(3)
+        banker_str = match.group(5)
+
+        player_ranks = extract_ranks(player_str)
+        banker_ranks = extract_ranks(banker_str)
+
+        if player_ranks and banker_ranks:
+            return {
+                "raw_id": raw_id,
+                "player_ranks": player_ranks,
+                "banker_ranks": banker_ranks,
+                "player_count": len(player_ranks),
+                "banker_count": len(banker_ranks),
+                "hour": datetime.now().hour,
+                "timestamp": datetime.now().isoformat(),
+                "text": text
+            }
+        else:
+            logger.warning(f"Не удалось извлечь карты для игры #{raw_id}: player='{player_str}', banker='{banker_str}'")
+    else:
+        match_id = re.search(r'#N(\d+)', text)
+        if match_id:
+            raw_id = int(match_id.group(1))
+            logger.warning(f"Не удалось разобрать игру #{raw_id}: {text[:50]}...")
+
+    return None
 
 
 def has_six(ranks: List[str]) -> bool:
@@ -66,65 +103,6 @@ def has_six(ranks: List[str]) -> bool:
 
 def has_seven(ranks: List[str]) -> bool:
     return '7' in ranks
-
-
-def parse_game(text: str) -> Optional[Dict]:
-    # Пробуем несколько паттернов для разбора
-    patterns = [
-        # Паттерн для формата с 🔰 или ✅
-        r'#N(\d+)\.\s*(\d+|✅?\d+|🔰?\d+)\s*\(([^)]+)\)\s*(?:👉|🔰|✅|-)\s*(\d+|✅?\d+|🔰?\d+)\s*\(([^)]+)\)',
-        # Альтернативный паттерн с разными разделителями
-        r'#N(\d+)\.\s*([^\(]+)\s*(?:👉|🔰|✅|-)\s*([^\(]+)'
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            raw_id = int(match.group(1))
-
-            # Для первого паттерна
-            if len(match.groups()) >= 5:
-                player_str = match.group(3)
-                banker_str = match.group(5)
-            else:
-                # Для второго паттерна - извлекаем из скобок
-                player_full = match.group(2)
-                banker_full = match.group(3)
-
-                # Ищем содержимое в скобках
-                player_match = re.search(r'\(([^)]+)\)', player_full)
-                banker_match = re.search(r'\(([^)]+)\)', banker_full)
-
-                player_str = player_match.group(1) if player_match else player_full
-                banker_str = banker_match.group(1) if banker_match else banker_full
-
-            player_ranks = extract_ranks(player_str)
-            banker_ranks = extract_ranks(banker_str)
-
-            if not player_ranks or not banker_ranks:
-                # Пробуем альтернативный метод извлечения
-                player_ranks = re.findall(r'([A-Z\d]+)[♣♦♥♠]\ufe0f?', player_str)
-                banker_ranks = re.findall(r'([A-Z\d]+)[♣♦♥♠]\ufe0f?', banker_str)
-
-            if player_ranks and banker_ranks:
-                return {
-                    "raw_id": raw_id,
-                    "player_ranks": player_ranks,
-                    "banker_ranks": banker_ranks,
-                    "player_count": len(player_ranks),
-                    "banker_count": len(banker_ranks),
-                    "hour": datetime.now().hour,
-                    "timestamp": datetime.now().isoformat(),
-                    "text": text
-                }
-
-    # Если ничего не нашли, пробуем более простой подход
-    match = re.search(r'#N(\d+)', text)
-    if match:
-        raw_id = int(match.group(1))
-        logger.warning(f"Не удалось разобрать игру #{raw_id}: {text[:50]}...")
-
-    return None
 
 
 # === ОБРАБОТКА СООБЩЕНИЙ ===
@@ -144,11 +122,10 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_id = game["raw_id"]
     logger.info(f"📥 Игра #{raw_id}: игрок={game['player_count']} карт {game['player_ranks']}")
 
-    # Сохраняем историю (для возможного будущего использования)
     history = load_json(HISTORY_FILE, [])
     history = [g for g in history if g.get("raw_id") != raw_id]
     history.append(game)
-    save_json(HISTORY_FILE, history[-300:])  # последние 300 игр
+    save_json(HISTORY_FILE, history[-300:])
 
     # === Проверка активного прогноза: 2 карты (после 6) ===
     two_pred = load_json(TWO_CARDS_PRED_FILE, {})
@@ -181,7 +158,6 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     stats["fail"] = stats.get("fail", 0) + 1
                     two_pred = {}
                     save_json(TWO_CARDS_PRED_FILE, {})
-
                 save_json(STATS_TWO_CARDS_FILE, stats)
             except Exception as e:
                 logger.error(f"Ошибка проверки two_cards (после 6): {e}")
@@ -217,7 +193,6 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     stats["fail"] = stats.get("fail", 0) + 1
                     three_pred = {}
                     save_json(THREE_CARDS_PRED_FILE, {})
-
                 save_json(STATS_THREE_CARDS_FILE, stats)
             except Exception as e:
                 logger.error(f"Ошибка проверки three_cards (после 7): {e}")
@@ -225,12 +200,11 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === Создание новых прогнозов ===
     normalized = (raw_id - 1) % TOTAL_GAMES + 1
     if normalized == TOTAL_GAMES:
-        return  # не предсказываем на игру 1441
+        return
 
     target_raw = raw_id + 1
-    target_norm = (target_raw - 1) % TOTAL_GAMES + 1
+    target_norm = (target_raw - 1) % TOTAL_GAMES + 2
 
-    # --- Прогноз 1: если у игрока сейчас 6 → прогноз "2 карты" на следующую игру ---
     two_pred_current = load_json(TWO_CARDS_PRED_FILE, {})
     if not two_pred_current:
         if has_six(game["player_ranks"]):
@@ -241,10 +215,7 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🎯 *ДА*\n"
                     f"⏳ Ожидание..."
                 )
-                sent = await context.bot.send_message(
-                    chat_id=PRED_CHANNEL,
-                    text=pred_text
-                )
+                sent = await context.bot.send_message(chat_id=PRED_CHANNEL, text=pred_text)
                 save_json(TWO_CARDS_PRED_FILE, {
                     "target_raw": target_raw,
                     "target": target_norm,
@@ -254,7 +225,6 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Ошибка отправки two_cards (после 6): {e}")
 
-    # --- Прогноз 2: если у игрока сейчас 7 → прогноз "3 карты" на следующую игру ---
     three_pred_current = load_json(THREE_CARDS_PRED_FILE, {})
     if not three_pred_current:
         if has_seven(game["player_ranks"]):
@@ -265,10 +235,7 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🎯 *ДА*\n"
                     f"⏳ Ожидание..."
                 )
-                sent = await context.bot.send_message(
-                    chat_id=PRED_CHANNEL,
-                    text=pred_text
-                )
+                sent = await context.bot.send_message(chat_id=PRED_CHANNEL, text=pred_text)
                 save_json(THREE_CARDS_PRED_FILE, {
                     "target_raw": target_raw,
                     "target": target_norm,
@@ -279,7 +246,7 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Ошибка отправки three_cards (после 7): {e}")
 
 
-# === КОМАНДА /stats — показывает статистику по обоим модулям ===
+# === КОМАНДА /stats ===
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != PRED_CHANNEL:
         return
