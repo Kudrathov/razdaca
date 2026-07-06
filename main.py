@@ -203,7 +203,7 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target_raw = raw_id + 1
-    target_norm = (target_raw - 1) % TOTAL_GAMES + 2
+    target_norm = (target_raw - 1) % TOTAL_GAMES + 1
 
     two_pred_current = load_json(TWO_CARDS_PRED_FILE, {})
     if not two_pred_current:
